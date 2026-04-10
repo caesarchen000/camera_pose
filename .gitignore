@@ -1,0 +1,28 @@
+# Large local assets (do not commit)
+DL3DV-Benchmark/
+DL3DV-10K-Sample/
+CambridgeLandmarks/
+datasets/
+data/
+
+# Model checkpoints / weights
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated outputs and logs
+outputs/*
+!outputs/*.csv
+logs/
+*.log
+
+# Python environment/cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
