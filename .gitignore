@@ -4,6 +4,7 @@ DL3DV-10K-Sample/
 CambridgeLandmarks/
 datasets/
 data/
+metadata/
 
 # Model checkpoints / weights
 checkpoints/
@@ -12,9 +13,10 @@ checkpoints/
 *.ckpt
 *.safetensors
 
+*.png
+*.mp4
+
 # Generated outputs and logs
-outputs/*
-!outputs/*.csv
 logs/
 *.log
 

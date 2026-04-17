@@ -240,17 +240,22 @@ def geodesic_rotation_error_deg(R_pred: np.ndarray, R_gt: np.ndarray) -> float:
 
 
 def translation_direction_angle_error_deg(t_pred: np.ndarray, t_gt: np.ndarray) -> float:
+    """
+    Translation direction angle error matching paper formula 4:
+      dist_t(t1, t2) = arccos(|t1/||t1|| · t2/||t2|||)
+
+    The absolute value makes this sign-agnostic, which is correct for two-view
+    pose estimation where the sign of translation is ambiguous.
+    """
     np_pred = np.linalg.norm(t_pred)
     np_gt = np.linalg.norm(t_gt)
-    # If predicted translation collapses to (near) zero while GT is valid,
-    # treat it as a complete direction failure instead of dropping the pair.
     if np_gt < 1e-9:
         return float("nan")
     if np_pred < 1e-9:
         return 180.0
     v0 = t_pred / np_pred
     v1 = t_gt / np_gt
-    d = float(np.clip(np.dot(v0, v1), -1.0, 1.0))
+    d = float(np.clip(abs(np.dot(v0, v1)), 0.0, 1.0))
     return float(np.degrees(np.arccos(d)))
 
 
@@ -666,6 +671,15 @@ def main() -> None:
         help="Optional: save selected pair list as CSV.",
     )
     parser.add_argument(
+        "--input_pairs_csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional: evaluate using an existing pairs CSV (must contain rel_a, rel_b). "
+            "If set, pair-selection filters are skipped."
+        ),
+    )
+    parser.add_argument(
         "--save_pairs_txt",
         type=Path,
         default=None,
@@ -726,30 +740,59 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Step 2: select pairs
     # ------------------------------------------------------------------
-    print(
-        f"\nSelecting same-scene pairs with yaw ∈ "
-        f"[{args.yaw_min}, {args.yaw_max}]°, pitch_diff <= {args.pitch_max}°, "
-        f"forward >= {args.min_forward_angle}°, baseline >= {args.min_baseline}m, "
-        f"look_to_mid <= {args.max_look_to_mid_angle if args.max_look_to_mid_angle is not None else 'disabled'}°, "
-        f"overlap <= {args.max_overlap_ratio if args.max_overlap_ratio is not None else 'disabled'} ..."
-    )
-    selected = select_pairs(
-        frames=frames,
-        dl3dv_root=dl3dv_root,
-        yaw_min=args.yaw_min,
-        yaw_max=args.yaw_max,
-        pitch_max=args.pitch_max,
-        min_forward_angle=args.min_forward_angle,
-        min_baseline=args.min_baseline,
-        max_look_to_mid_angle=args.max_look_to_mid_angle,
-        max_overlap_ratio=args.max_overlap_ratio,
-        overlap_check_max_side=args.overlap_check_max_side,
-        overlap_prefilter_factor=args.overlap_prefilter_factor,
-        max_pairs=args.max_pairs,
-        max_pairs_per_scene=args.max_pairs_per_scene,
-        exclude_scene_prefixes=list(args.exclude_scene),
-        seed=args.seed,
-    )
+    if args.input_pairs_csv is not None:
+        pairs_csv = args.input_pairs_csv.resolve()
+        print(f"\nLoading selected pairs from CSV: {pairs_csv}")
+        idx_by_rel = {f.rel_path: i for i, f in enumerate(frames)}
+        selected = []
+        with pairs_csv.open(newline="") as f:
+            reader = csv.DictReader(f)
+            cols = set(reader.fieldnames or [])
+            if "rel_a" not in cols or "rel_b" not in cols:
+                raise RuntimeError(
+                    f"{pairs_csv} must contain columns rel_a and rel_b, got: {sorted(cols)}"
+                )
+            for row in reader:
+                ra = str(row["rel_a"]).strip()
+                rb = str(row["rel_b"]).strip()
+                if ra not in idx_by_rel or rb not in idx_by_rel:
+                    continue
+                i = idx_by_rel[ra]
+                j = idx_by_rel[rb]
+                yd = float(row.get("yaw_diff_deg", float("nan")))
+                pd = float(row.get("pitch_diff_deg", float("nan")))
+                rot = float(row.get("rot_deg", float("nan")))
+                fa = float(row.get("forward_angle_deg", float("nan")))
+                bl = float(row.get("baseline_m", float("nan")))
+                selected.append((i, j, yd, pd, rot, fa, bl))
+        if args.max_pairs > 0:
+            selected = selected[: args.max_pairs]
+        print(f"  Loaded {len(selected)} pairs from input CSV.")
+    else:
+        print(
+            f"\nSelecting same-scene pairs with yaw ∈ "
+            f"[{args.yaw_min}, {args.yaw_max}]°, pitch_diff <= {args.pitch_max}°, "
+            f"forward >= {args.min_forward_angle}°, baseline >= {args.min_baseline}m, "
+            f"look_to_mid <= {args.max_look_to_mid_angle if args.max_look_to_mid_angle is not None else 'disabled'}°, "
+            f"overlap <= {args.max_overlap_ratio if args.max_overlap_ratio is not None else 'disabled'} ..."
+        )
+        selected = select_pairs(
+            frames=frames,
+            dl3dv_root=dl3dv_root,
+            yaw_min=args.yaw_min,
+            yaw_max=args.yaw_max,
+            pitch_max=args.pitch_max,
+            min_forward_angle=args.min_forward_angle,
+            min_baseline=args.min_baseline,
+            max_look_to_mid_angle=args.max_look_to_mid_angle,
+            max_overlap_ratio=args.max_overlap_ratio,
+            overlap_check_max_side=args.overlap_check_max_side,
+            overlap_prefilter_factor=args.overlap_prefilter_factor,
+            max_pairs=args.max_pairs,
+            max_pairs_per_scene=args.max_pairs_per_scene,
+            exclude_scene_prefixes=list(args.exclude_scene),
+            seed=args.seed,
+        )
     if not selected:
         raise RuntimeError(
             f"No pairs found with yaw in [{args.yaw_min}, {args.yaw_max}] and "

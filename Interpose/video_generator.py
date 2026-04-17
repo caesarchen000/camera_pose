@@ -97,6 +97,32 @@ def resolve_inputs(
     }
 
 
+def resolve_inputs_from_paths(
+    start_image: Path,
+    end_image: Path,
+    prompt: str,
+) -> dict[str, Any]:
+    """Bundle from explicit image paths (bypasses CSV lookup)."""
+    path_a = start_image.resolve()
+    path_b = end_image.resolve()
+    if not path_a.is_file():
+        raise FileNotFoundError(f"Start image not found: {path_a}")
+    if not path_b.is_file():
+        raise FileNotFoundError(f"End image not found: {path_b}")
+    p = prompt.strip()
+    if not p:
+        raise ValueError("prompt is empty after strip()")
+    scene = path_a.parent.name or "manual_pair"
+    return {
+        "path_start": path_a,
+        "path_end": path_b,
+        "scene": scene,
+        "csv_row": {},
+        "prompt": p,
+        "pair_index": 0,
+    }
+
+
 def save_pre_model_inputs(
     dest_dir: Path,
     path_start: Path,
@@ -270,9 +296,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="CSV pair + prompt → optional DynamiCrafter 512 interp via official inference.py."
     )
-    p.add_argument("--pairs_csv", type=Path, required=True)
-    p.add_argument("--data_root", type=Path, required=True)
+    p.add_argument("--pairs_csv", type=Path, default=None)
+    p.add_argument("--data_root", type=Path, default=None)
     p.add_argument("--pair_index", type=int, default=0)
+    p.add_argument("--start_image", type=Path, default=None, help="Optional explicit start image path.")
+    p.add_argument("--end_image", type=Path, default=None, help="Optional explicit end image path.")
     p.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     p.add_argument(
         "--out_dir",
@@ -305,7 +333,14 @@ def default_out_dir(bundle: dict[str, Any], override: Path | None) -> Path:
 def main() -> None:
     args = parse_args()
     try:
-        bundle = resolve_inputs(args.pairs_csv, args.data_root, args.pair_index, args.prompt)
+        if args.start_image is not None or args.end_image is not None:
+            if args.start_image is None or args.end_image is None:
+                raise ValueError("Provide both --start_image and --end_image together.")
+            bundle = resolve_inputs_from_paths(args.start_image, args.end_image, args.prompt)
+        else:
+            if args.pairs_csv is None or args.data_root is None:
+                raise ValueError("Use either (--pairs_csv and --data_root) or (--start_image and --end_image).")
+            bundle = resolve_inputs(args.pairs_csv, args.data_root, args.pair_index, args.prompt)
     except (OSError, ValueError, IndexError) as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)

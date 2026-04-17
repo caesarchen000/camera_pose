@@ -1,0 +1,7 @@
+{
+  "source_csv": "outputs/Cambridge/cambridge_selp_official_pairs.csv",
+  "out_csv": "outputs/Cambridge/cambridge_selp_official_yaw50_65_strict.csv",
+  "yaw_min_deg": 50.0,
+  "yaw_max_deg": 65.0,
+  "num_pairs": 87
+}
