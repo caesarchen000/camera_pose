@@ -61,6 +61,13 @@ class CambridgeGtFrame:
     T_wc: np.ndarray
 
 
+@dataclass(frozen=True)
+class MetadataQuatFrame:
+    rel_path: str
+    scene_name: str
+    q_wxyz: np.ndarray
+
+
 def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     qw, qx, qy, qz = q.astype(np.float64)
     n = qw * qw + qx * qx + qy * qy + qz * qz
@@ -78,6 +85,56 @@ def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def build_pose_from_quaternion(q_wxyz: np.ndarray, quat_convention: str) -> np.ndarray:
+    R = quaternion_to_rotation_matrix(q_wxyz)
+    R_wc = R if quat_convention == "w2c" else R.T
+    T_wc = np.eye(4, dtype=np.float64)
+    T_wc[:3, :3] = R_wc
+    return T_wc
+
+
+def normalize_metadata_rel_path(raw_path: str) -> str:
+    return Path(raw_path.replace("\\", "/").lstrip("./")).as_posix()
+
+
+def build_metadata_quat_index(
+    metadata_npy: Path,
+    scene_names: Optional[Iterable[str]] = None,
+) -> Dict[str, MetadataQuatFrame]:
+    wanted = set(scene_names) if scene_names else None
+    metadata_obj = np.load(metadata_npy, allow_pickle=True).item()
+    if not isinstance(metadata_obj, dict):
+        raise ValueError(f"Unexpected metadata format in {metadata_npy}")
+    quat_index: Dict[str, MetadataQuatFrame] = {}
+    for pair in metadata_obj.values():
+        if not isinstance(pair, dict):
+            continue
+        for image_key in ("img1", "img2"):
+            image_meta = pair.get(image_key, {})
+            if not isinstance(image_meta, dict):
+                continue
+            rel_path = normalize_metadata_rel_path(str(image_meta.get("path", "")).strip())
+            if not rel_path or rel_path in quat_index:
+                continue
+            scene_name = str(pair.get("scene", "")).strip() or Path(rel_path).parts[0]
+            if wanted is not None and scene_name not in wanted:
+                continue
+            quat_index[rel_path] = MetadataQuatFrame(
+                rel_path=rel_path,
+                scene_name=scene_name,
+                q_wxyz=np.array(
+                    [
+                        float(image_meta.get("qw", 1.0)),
+                        float(image_meta.get("qx", 0.0)),
+                        float(image_meta.get("qy", 0.0)),
+                        float(image_meta.get("qz", 0.0)),
+                    ],
+                    dtype=np.float64,
+                ),
+            )
+    return quat_index
 
 
 def build_cambridge_gt_pose_index(
@@ -157,6 +214,30 @@ def maybe_float(row: Dict[str, str], key: str) -> float:
         return float("nan")
 
 
+def resolve_image_path(rel_path: str, cambridge_root: Path, metadata_image_root: Optional[Path]) -> Path:
+    candidates = [cambridge_root / rel_path]
+    if metadata_image_root is not None:
+        candidates.append(metadata_image_root / rel_path)
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    return candidates[0].resolve()
+
+
+def resolve_gt_pose(
+    rel_path: str,
+    quat_convention: str,
+    gt_pose_index: Dict[str, CambridgeGtFrame],
+    metadata_quat_index: Dict[str, MetadataQuatFrame],
+) -> Optional[np.ndarray]:
+    if rel_path in gt_pose_index:
+        return gt_pose_index[rel_path].T_wc
+    m = metadata_quat_index.get(rel_path)
+    if m is None:
+        return None
+    return build_pose_from_quaternion(m.q_wxyz, quat_convention)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate DUSt3R on Cambridge pairs.")
     parser.add_argument(
@@ -168,8 +249,20 @@ def main() -> None:
     parser.add_argument(
         "--pairs_csv",
         type=Path,
-        default=Path("outputs/Cambridge/cambridge_pairs_yaw50_65_300.csv"),
+        default=Path("outputs/Cambridge/cambridge_pairs_selp_metadata_only_strict_yaw50_65.csv"),
         help="Pair CSV from scripts/Cambridge/make_cambridge_pairs.py.",
+    )
+    parser.add_argument(
+        "--metadata_npy",
+        type=Path,
+        default=Path("metadata/metadata/selp_test_set.npy"),
+        help="Optional sELP metadata .npy used for fallback GT quaternions.",
+    )
+    parser.add_argument(
+        "--metadata_image_root",
+        type=Path,
+        default=Path("metadata/metadata/images_to_npys/test_scenes_images/selp"),
+        help="Optional root for metadata-backed images such as Street.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -218,6 +311,8 @@ def main() -> None:
 
     cambridge_root = args.cambridge_root.resolve()
     pairs_csv = args.pairs_csv.resolve()
+    metadata_npy = args.metadata_npy.resolve()
+    metadata_image_root = args.metadata_image_root.resolve()
     checkpoint = args.checkpoint.resolve()
     dust3r_root = args.dust3r_root.resolve()
     save_metrics_csv = args.save_metrics_csv.resolve()
@@ -230,6 +325,9 @@ def main() -> None:
         raise FileNotFoundError(f"Pairs CSV not found: {pairs_csv}")
     if not checkpoint.is_file():
         raise FileNotFoundError(f"DUSt3R checkpoint not found: {checkpoint}")
+    if not metadata_image_root.is_dir():
+        print(f"[warn] Metadata image root not found, fallback disabled: {metadata_image_root}")
+        metadata_image_root = None
 
     if str(dust3r_root) not in sys.path:
         sys.path.insert(0, str(dust3r_root))
@@ -255,6 +353,16 @@ def main() -> None:
         scene_names=scenes_from_csv if scenes_from_csv else None,
     )
     print(f"[info] GT indexed images: {len(gt_pose_index)}")
+    metadata_quat_index: Dict[str, MetadataQuatFrame] = {}
+    if metadata_npy.is_file():
+        print(f"[info] Building metadata quaternion index from {metadata_npy} ...")
+        metadata_quat_index = build_metadata_quat_index(
+            metadata_npy=metadata_npy,
+            scene_names=scenes_from_csv if scenes_from_csv else None,
+        )
+        print(f"[info] Metadata indexed images: {len(metadata_quat_index)}")
+    else:
+        print(f"[warn] Metadata .npy not found, fallback GT disabled: {metadata_npy}")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"[info] Loading DUSt3R checkpoint: {checkpoint}")
@@ -274,18 +382,18 @@ def main() -> None:
         pair_idx = int(row["pair_idx"])
         rel_a = str(row["rel_a"]).strip()
         rel_b = str(row["rel_b"]).strip()
-        img_a = (cambridge_root / rel_a).resolve()
-        img_b = (cambridge_root / rel_b).resolve()
+        quat_convention = str(row.get("quat_convention", "w2c")).strip() or "w2c"
+        img_a = resolve_image_path(rel_a, cambridge_root, metadata_image_root)
+        img_b = resolve_image_path(rel_b, cambridge_root, metadata_image_root)
 
         if not img_a.is_file() or not img_b.is_file():
             print(f"[skip] pair_idx={pair_idx} missing image")
             continue
-        if rel_a not in gt_pose_index or rel_b not in gt_pose_index:
+        T_gt_a = resolve_gt_pose(rel_a, quat_convention, gt_pose_index, metadata_quat_index)
+        T_gt_b = resolve_gt_pose(rel_b, quat_convention, gt_pose_index, metadata_quat_index)
+        if T_gt_a is None or T_gt_b is None:
             print(f"[skip] pair_idx={pair_idx} missing GT pose index")
             continue
-
-        T_gt_a = gt_pose_index[rel_a].T_wc
-        T_gt_b = gt_pose_index[rel_b].T_wc
 
         try:
             T_pred_a, T_pred_b = run_dust3r_pair_pose(

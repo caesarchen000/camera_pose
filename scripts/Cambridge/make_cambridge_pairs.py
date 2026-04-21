@@ -20,7 +20,7 @@ Default behavior:
   - keep only pairs from the same sequence
   - keep only pairs whose yaw difference is in [50, 65] degrees
   - record yaw difference, pitch difference, geodesic rotation angle, and baseline
-  - sample 300 pairs in a random round-robin way across sequences
+  - sample 290 pairs in a random round-robin way across sequences
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,22 @@ class PairCandidate:
     pitch_diff_deg: float
     geodesic_rot_deg: float
     baseline: float
+
+
+@dataclass(frozen=True)
+class MetadataPairCandidate:
+    scene_name: str
+    sequence_name: str
+    sequence_b: str
+    rel_a: str
+    rel_b: str
+    yaw_diff_deg: float
+    pitch_diff_deg: float
+    geodesic_rot_deg: float
+    overlap_amount: str
+    metadata_scene: str
+    pose_source: str
+    quat_convention: str
 
 
 def dot(a: Sequence[float], b: Sequence[float]) -> float:
@@ -172,6 +188,104 @@ def geodesic_rotation_deg(quat_a: Sequence[float], quat_b: Sequence[float]) -> f
 def parse_frame_index(rel_image_path: str) -> int:
     match = re.search(r"frame(\d+)", Path(rel_image_path).stem)
     return int(match.group(1)) if match else -1
+
+
+def normalize_metadata_rel_path(raw_path: str) -> str:
+    return Path(raw_path.replace("\\", "/").lstrip("./")).as_posix()
+
+
+def sequence_name_from_rel_path(rel_path: str) -> str:
+    parts = Path(rel_path).parts
+    if len(parts) >= 2:
+        return parts[1]
+    return ""
+
+
+def build_metadata_candidates(
+    metadata_npy: Path,
+    yaw_min: float,
+    yaw_max: float,
+    max_pitch_diff: Optional[float],
+    scene_names: Optional[Iterable[str]] = None,
+) -> Dict[Tuple[str, str], List[MetadataPairCandidate]]:
+    wanted = set(scene_names) if scene_names else None
+    metadata_obj = np_load_dict(metadata_npy)
+    grouped: Dict[Tuple[str, str], List[MetadataPairCandidate]] = {}
+
+    for pair in metadata_obj.values():
+        if not isinstance(pair, dict):
+            continue
+        img1 = pair.get("img1", {})
+        img2 = pair.get("img2", {})
+        if not isinstance(img1, dict) or not isinstance(img2, dict):
+            continue
+
+        rel_a = normalize_metadata_rel_path(str(img1.get("path", "")).strip())
+        rel_b = normalize_metadata_rel_path(str(img2.get("path", "")).strip())
+        if not rel_a or not rel_b:
+            continue
+
+        scene_name = str(pair.get("scene", "")).strip() or (Path(rel_a).parts[0] if Path(rel_a).parts else "")
+        if wanted is not None and scene_name not in wanted:
+            continue
+
+        q_a = (
+            float(img1.get("qw", 1.0)),
+            float(img1.get("qx", 0.0)),
+            float(img1.get("qy", 0.0)),
+            float(img1.get("qz", 0.0)),
+        )
+        q_b = (
+            float(img2.get("qw", 1.0)),
+            float(img2.get("qx", 0.0)),
+            float(img2.get("qy", 0.0)),
+            float(img2.get("qz", 0.0)),
+        )
+        f_a = camera_forward_world(q_a)
+        f_b = camera_forward_world(q_b)
+        u_a = camera_up_world(q_a)
+        u_b = camera_up_world(q_b)
+        up_ref = normalize((u_a[0] + u_b[0], u_a[1] + u_b[1], u_a[2] + u_b[2]), (0.0, 1.0, 0.0))
+
+        yaw_diff = yaw_diff_deg_wrt_up(f_a, f_b, up_ref)
+        if yaw_diff < yaw_min or yaw_diff > yaw_max:
+            continue
+
+        pitch_diff = abs(pitch_deg_wrt_up(f_a, up_ref) - pitch_deg_wrt_up(f_b, up_ref))
+        if max_pitch_diff is not None and pitch_diff > max_pitch_diff:
+            continue
+
+        seq_a = sequence_name_from_rel_path(rel_a)
+        seq_b = sequence_name_from_rel_path(rel_b)
+        cand = MetadataPairCandidate(
+            scene_name=scene_name,
+            sequence_name=seq_a,
+            sequence_b=seq_b,
+            rel_a=rel_a,
+            rel_b=rel_b,
+            yaw_diff_deg=yaw_diff,
+            pitch_diff_deg=pitch_diff,
+            geodesic_rot_deg=geodesic_rotation_deg(q_a, q_b),
+            overlap_amount=str(pair.get("overlap_amount", "")).strip(),
+            metadata_scene=scene_name,
+            pose_source="selp_npy_quaternion",
+            quat_convention="w2c",
+        )
+        grouped.setdefault((scene_name, seq_a), []).append(cand)
+    return grouped
+
+
+def np_load_dict(path: Path) -> Dict[Any, Any]:
+    import numpy as np
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Metadata npy not found: {path}")
+    obj = np.load(path, allow_pickle=True)
+    if isinstance(obj, np.ndarray) and obj.shape == ():
+        obj = obj.item()
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected dict in {path}, got {type(obj)}")
+    return obj
 
 
 def load_cambridge_frames(
@@ -332,6 +446,42 @@ def round_robin_sample(
     return chosen
 
 
+def round_robin_sample_metadata(
+    grouped_candidates: Dict[Tuple[str, str], List[MetadataPairCandidate]],
+    max_pairs: int,
+    seed: int,
+) -> List[MetadataPairCandidate]:
+    rng = random.Random(seed)
+    shuffled_candidates: Dict[Tuple[str, str], List[MetadataPairCandidate]] = {}
+    groups = []
+    for group, pairs in grouped_candidates.items():
+        if not pairs:
+            continue
+        pairs_copy = list(pairs)
+        rng.shuffle(pairs_copy)
+        shuffled_candidates[group] = pairs_copy
+        groups.append(group)
+    rng.shuffle(groups)
+
+    chosen: List[MetadataPairCandidate] = []
+    group_ptrs = {group: 0 for group in groups}
+    while len(chosen) < max_pairs:
+        progressed = False
+        for group in groups:
+            ptr = group_ptrs[group]
+            pairs = shuffled_candidates[group]
+            if ptr >= len(pairs):
+                continue
+            chosen.append(pairs[ptr])
+            group_ptrs[group] = ptr + 1
+            progressed = True
+            if len(chosen) >= max_pairs:
+                break
+        if not progressed:
+            break
+    return chosen
+
+
 def save_pairs_csv(pairs: Sequence[PairCandidate], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="") as f:
@@ -374,6 +524,60 @@ def save_pairs_csv(pairs: Sequence[PairCandidate], out_csv: Path) -> None:
             )
 
 
+def save_metadata_pairs_csv(pairs: Sequence[MetadataPairCandidate], out_csv: Path) -> None:
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "pair_idx",
+                "pair_source",
+                "scene_name",
+                "sequence_name",
+                "sequence_b",
+                "split_a",
+                "split_b",
+                "rel_a",
+                "rel_b",
+                "yaw_diff_deg",
+                "pitch_diff_deg",
+                "geodesic_rot_deg",
+                "baseline",
+                "frame_idx_a",
+                "frame_idx_b",
+                "overlap_amount",
+                "metadata_scene",
+                "pose_source",
+                "quat_convention",
+            ],
+        )
+        writer.writeheader()
+        for pair_idx, cand in enumerate(pairs):
+            writer.writerow(
+                {
+                    "pair_idx": pair_idx,
+                    "pair_source": "selp_metadata",
+                    "scene_name": cand.scene_name,
+                    "sequence_name": cand.sequence_name,
+                    "sequence_b": cand.sequence_b,
+                    "split_a": "",
+                    "split_b": "",
+                    "rel_a": cand.rel_a,
+                    "rel_b": cand.rel_b,
+                    "yaw_diff_deg": f"{cand.yaw_diff_deg:.6f}",
+                    "pitch_diff_deg": f"{cand.pitch_diff_deg:.6f}",
+                    "geodesic_rot_deg": f"{cand.geodesic_rot_deg:.6f}",
+                    "baseline": "",
+                    "frame_idx_a": "",
+                    "frame_idx_b": "",
+                    "overlap_amount": cand.overlap_amount,
+                    "metadata_scene": cand.metadata_scene,
+                    "pose_source": cand.pose_source,
+                    "quat_convention": cand.quat_convention,
+                }
+            )
+
+
 def parse_scene_list(scene_csv: str) -> Optional[List[str]]:
     if not scene_csv.strip():
         return None
@@ -385,6 +589,12 @@ def main() -> None:
         description="Build same-sequence Cambridge pairs in a target yaw range."
     )
     parser.add_argument(
+        "--source",
+        choices=("metadata", "datasets"),
+        default="metadata",
+        help="Pair source: metadata npy (default) or datasets/cambridge pose files.",
+    )
+    parser.add_argument(
         "--cambridge_root",
         type=Path,
         default=Path("datasets/cambridge"),
@@ -392,7 +602,7 @@ def main() -> None:
     )
     parser.add_argument("--yaw_min", type=float, default=50.0, help="Minimum yaw difference in degrees.")
     parser.add_argument("--yaw_max", type=float, default=65.0, help="Maximum yaw difference in degrees.")
-    parser.add_argument("--max_pairs", type=int, default=300, help="Maximum number of pairs to save.")
+    parser.add_argument("--max_pairs", type=int, default=290, help="Maximum number of pairs to save.")
     parser.add_argument(
         "--max_pitch_diff",
         type=float,
@@ -413,6 +623,12 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for group order shuffling.")
     parser.add_argument(
+        "--metadata_npy",
+        type=Path,
+        default=Path("metadata/metadata/selp_test_set.npy"),
+        help="Metadata npy used when --source metadata.",
+    )
+    parser.add_argument(
         "--available_images_root",
         type=Path,
         default=None,
@@ -424,21 +640,57 @@ def main() -> None:
     parser.add_argument(
         "--out_csv",
         type=Path,
-        default=Path("outputs/Cambridge/cambridge_pairs_yaw50_65_300.csv"),
+        default=Path("outputs/Cambridge/cambridge_pairs_yaw50_65_290.csv"),
         help="Output CSV path.",
     )
     args = parser.parse_args()
+
+    if args.yaw_min > args.yaw_max:
+        raise ValueError("--yaw_min must be <= --yaw_max")
+    scene_list = parse_scene_list(args.scenes)
+
+    if args.source == "metadata":
+        metadata_npy = args.metadata_npy.resolve()
+        grouped_meta = build_metadata_candidates(
+            metadata_npy=metadata_npy,
+            yaw_min=args.yaw_min,
+            yaw_max=args.yaw_max,
+            max_pitch_diff=args.max_pitch_diff,
+            scene_names=scene_list,
+        )
+        selected_meta = round_robin_sample_metadata(
+            grouped_candidates=grouped_meta,
+            max_pairs=args.max_pairs,
+            seed=args.seed,
+        )
+        if not selected_meta:
+            raise RuntimeError("No valid metadata pairs found with the requested filters.")
+        save_metadata_pairs_csv(selected_meta, args.out_csv)
+        valid_groups = sum(1 for pairs in grouped_meta.values() if pairs)
+        print(f"Source: metadata ({metadata_npy})")
+        print(f"Valid sequences with candidate pairs: {valid_groups}")
+        print(f"Saved pairs: {len(selected_meta)}")
+        print(f"CSV: {args.out_csv.resolve()}")
+        print(
+            "Yaw filter: "
+            f"[{args.yaw_min:.2f}, {args.yaw_max:.2f}] deg"
+            + (
+                ""
+                if args.max_pitch_diff is None
+                else f" | max pitch diff: {args.max_pitch_diff:.2f} deg"
+            )
+        )
+        if len(selected_meta) < args.max_pairs:
+            print(f"[warn] requested {args.max_pairs} pairs, but only {len(selected_meta)} were available.")
+        return
 
     cambridge_root = args.cambridge_root.resolve()
     if not cambridge_root.is_dir():
         raise FileNotFoundError(f"Cambridge root not found: {cambridge_root}")
 
-    if args.yaw_min > args.yaw_max:
-        raise ValueError("--yaw_min must be <= --yaw_max")
-
     frames_by_group = load_cambridge_frames(
         cambridge_root=cambridge_root,
-        scene_names=parse_scene_list(args.scenes),
+        scene_names=scene_list,
     )
     if args.available_images_root is not None:
         available_images_root = args.available_images_root.resolve()
@@ -476,6 +728,7 @@ def main() -> None:
     save_pairs_csv(selected, args.out_csv)
 
     valid_groups = sum(1 for pairs in grouped_candidates.values() if pairs)
+    print(f"Source: datasets ({cambridge_root})")
     print(f"Loaded frames: {total_frames}")
     print(f"Valid sequences with candidate pairs: {valid_groups}")
     print(f"Saved pairs: {len(selected)}")
