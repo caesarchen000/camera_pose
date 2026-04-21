@@ -5,6 +5,8 @@ CambridgeLandmarks/
 datasets/
 data/
 metadata/
+Interpose/DL3DV_300_videos/
+Interpose/out_cambridge_selp_yaw50_65_286pairs/
 
 # Model checkpoints / weights
 checkpoints/
