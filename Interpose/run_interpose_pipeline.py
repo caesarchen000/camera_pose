@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -27,6 +29,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ddim_steps", type=int, default=50)
     p.add_argument("--frame_stride", type=int, default=5)
     p.add_argument("--cfg_scale", type=float, default=7.5)
+    p.add_argument(
+        "--gpu_candidates",
+        type=str,
+        default="0,1",
+        help="Comma-separated CUDA device ids to try for video generation stage.",
+    )
+    p.add_argument(
+        "--min_free_mem_mb",
+        type=int,
+        default=512,
+        help="Minimum free memory (MB) required to choose a GPU.",
+    )
+    p.add_argument(
+        "--gpu_poll_seconds",
+        type=float,
+        default=5.0,
+        help="Seconds to wait before retrying GPU selection when all candidates are busy.",
+    )
 
     p.add_argument("--checkpoint", type=Path, required=True, help="DUSt3R checkpoint path.")
     p.add_argument("--dust3r_root", type=Path, default=Path("dust3r"))
@@ -73,14 +93,64 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def run_cmd(cmd: list[str], cwd: Path) -> None:
+def run_cmd(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print("\n[cmd]", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+    subprocess.run(cmd, cwd=str(cwd), check=True, env=env)
 
 
 def count_csv_rows(csv_path: Path) -> int:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         return sum(1 for _ in csv.DictReader(f))
+
+
+def _parse_gpu_candidates(text: str) -> list[int]:
+    out: list[int] = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        out.append(int(chunk))
+    if not out:
+        raise ValueError("No valid --gpu_candidates provided.")
+    return out
+
+
+def _query_free_mem_mb(gpu_ids: list[int]) -> dict[int, int]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    free_by_id: dict[int, int] = {}
+    wanted = set(gpu_ids)
+    for raw_line in res.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+            free_mb = int(parts[1])
+        except ValueError:
+            continue
+        if idx in wanted:
+            free_by_id[idx] = free_mb
+    return free_by_id
+
+
+def _pick_gpu(gpu_ids: list[int], min_free_mem_mb: int) -> int:
+    free_by_id = _query_free_mem_mb(gpu_ids)
+    ranked = sorted(((free_by_id.get(i, -1), i) for i in gpu_ids), reverse=True)
+    free_mb, gpu_id = ranked[0]
+    if free_mb < min_free_mem_mb:
+        raise RuntimeError(
+            f"All candidate GPUs are below min free memory {min_free_mem_mb} MB; "
+            f"observed: {free_by_id}"
+        )
+    return gpu_id
 
 
 def main() -> None:
@@ -108,7 +178,17 @@ def main() -> None:
 
     # Stage 1: generate 4 variants for each target pair.
     if not args.skip_generation:
+        gpu_ids = _parse_gpu_candidates(args.gpu_candidates)
         for pair_idx in range(args.start_index, end_index):
+            while True:
+                try:
+                    selected_gpu = _pick_gpu(gpu_ids, args.min_free_mem_mb)
+                    break
+                except Exception as e:
+                    print(f"[warn] GPU selection failed for pair {pair_idx}: {e}")
+                    print(f"[info] Retrying in {args.gpu_poll_seconds:.1f}s ...")
+                    time.sleep(args.gpu_poll_seconds)
+
             cmd = [
                 sys.executable,
                 "Interpose/generate_four_variants.py",
@@ -137,7 +217,14 @@ def main() -> None:
             ]
             if args.skip_existing_videos:
                 cmd.append("--skip_existing")
-            run_cmd(cmd, cwd=repo_root)
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = str(selected_gpu)
+            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            print(
+                f"[info] Pair {pair_idx}: using GPU {selected_gpu} "
+                f"(candidates={gpu_ids})"
+            )
+            run_cmd(cmd, cwd=repo_root, env=env)
 
     # Stage 2: generate subsets.
     if not args.skip_subsets:

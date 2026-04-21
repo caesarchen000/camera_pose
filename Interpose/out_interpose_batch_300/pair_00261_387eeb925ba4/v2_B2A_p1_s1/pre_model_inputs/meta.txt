@@ -1,2 +1,0 @@
-height=320 width=512
-Same transform chain as DynamiCrafter/scripts/evaluation/inference.py load_data_prompts.

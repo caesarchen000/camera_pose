@@ -21,6 +21,23 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def _allow_autocast() -> bool:
+    """
+    Mixed precision is enabled by default for memory efficiency.
+    Set DYNAMICRAFTER_ALLOW_AUTOCAST=0 to force full FP32.
+    """
+    raw = os.environ.get("DYNAMICRAFTER_ALLOW_AUTOCAST", "").strip().lower()
+    if raw in ("0", "false", "no"):
+        return False
+    if raw in ("1", "true", "yes"):
+        return True
+    return True
+
+
+def _force_fp16() -> bool:
+    return _env_truthy("DYNAMICRAFTER_FORCE_FP16")
+
+
 def _dynamicrafter_decode_debug(batch_images: torch.Tensor, out_dir: str, stem: str) -> None:
     """Log pixel stats and save first/last temporal frame as PNG (batch item 0)."""
     x = batch_images.detach().float().cpu()
@@ -183,8 +200,9 @@ def save_results_seperate(prompt, samples, filename, fakedir, fps=10, loop=False
 def get_latent_z(model, videos):
     b, c, t, h, w = videos.shape
     x = rearrange(videos, 'b c t h w -> (b t) c h w')
-    with torch.cuda.amp.autocast(enabled=False):
-        z = model.encode_first_stage(x.float())
+    with torch.cuda.amp.autocast(enabled=_allow_autocast()):
+        z_in = x.half() if _force_fp16() else x.float()
+        z = model.encode_first_stage(z_in)
     z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
     return z
 
@@ -281,9 +299,10 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
                     )
                 )
 
-        ## reconstruct from latent to pixel space (FP32: VAE decode under autocast often collapses to garbage)
-        with torch.cuda.amp.autocast(enabled=False):
-            batch_images = model.decode_first_stage(samples.float())
+        ## Decode under same precision mode for consistent behavior.
+        with torch.cuda.amp.autocast(enabled=_allow_autocast()):
+            dec_in = samples.half() if _force_fp16() else samples.float()
+            batch_images = model.decode_first_stage(dec_in)
         if debug_decode_dir is not None and _env_truthy("DYNAMICRAFTER_DEBUG_DECODE"):
             _dynamicrafter_decode_debug(
                 batch_images, debug_decode_dir, stem=("decode" if n_samples == 1 else f"decode_v{variant_i}")
@@ -307,6 +326,9 @@ def run_inference(args, gpu_num, gpu_no):
     assert os.path.exists(args.ckpt_path), "Error: checkpoint Not Found!"
     model = load_model_checkpoint(model, args.ckpt_path)
     model.eval()
+    if _force_fp16():
+        print("[info] DYNAMICRAFTER_FORCE_FP16=1 -> casting model to float16")
+        model = model.half()
 
     ## run over data
     assert (args.height % 16 == 0) and (args.width % 16 == 0), "Error: image size [h,w] should be multiples of 16!"
@@ -342,9 +364,8 @@ def run_inference(args, gpu_num, gpu_no):
         os.makedirs(debug_decode_dir, exist_ok=True)
 
     start = time.time()
-    # Full FP32: mixed precision here has produced incoherent latents / VAE garbage on some
-    # torch/CUDA stacks (512 interp included). Matches the stable Gradio interp path.
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+    use_amp = _allow_autocast()
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_amp):
         for idx, indice in tqdm(enumerate(range(0, len(prompt_list_rank), args.bs)), desc='Sample Batch'):
             prompts = prompt_list_rank[indice:indice+args.bs]
             videos = data_list_rank[indice:indice+args.bs]
@@ -403,6 +424,10 @@ if __name__ == '__main__':
     print("@DynamiCrafter cond-Inference: %s"%now)
     parser = get_parser()
     args = parser.parse_args()
+
+    # Keep sampling behavior stable across runs for fixed seeds.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
     seed = args.seed
     if seed < 0:

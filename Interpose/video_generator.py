@@ -62,7 +62,7 @@ def load_pair_row(
             rel_b = (row.get("rel_b") or "").strip()
             if not rel_a or not rel_b:
                 raise ValueError(f"Row {pair_index}: empty rel_a or rel_b")
-            scene = (row.get("scene") or "unknown_scene").strip()
+            scene = (row.get("scene") or row.get("scene_name") or "unknown_scene").strip()
             path_a = (data_root / rel_a).resolve()
             path_b = (data_root / rel_b).resolve()
             if not path_a.is_file():
