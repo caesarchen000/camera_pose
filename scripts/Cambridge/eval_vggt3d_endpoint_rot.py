@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import json
 from pathlib import Path
 
 import numpy as np
@@ -93,12 +94,35 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/Cambridge/vggt3d_286_rot_metrics.csv"),
         help="Output CSV path.",
     )
+    p.add_argument(
+        "--selected_jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "Optional selected_per_pair.jsonl. When provided, pairs with selected_variant "
+            "containing '_B2A_' are evaluated with inverted endpoint direction."
+        ),
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     quat_index = build_quat_index(args.metadata_npy.resolve())
+    selected_variant_by_idx: dict[int, str] = {}
+    if args.selected_jsonl is not None:
+        with args.selected_jsonl.resolve().open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                pair_name = Path(str(rec.get("pair_dir", ""))).name
+                parts = pair_name.split("_")
+                if len(parts) < 2:
+                    continue
+                pair_idx = int(parts[1])
+                selected_variant_by_idx[pair_idx] = str(rec.get("selected_variant", ""))
 
     out_rows = []
     with args.pairs_csv.resolve().open() as f:
@@ -117,6 +141,11 @@ def main() -> None:
             gt_rel_rot_deg = float("nan")
             pred_rel_rot_deg = float("nan")
             status = "ok"
+            selected_variant = selected_variant_by_idx.get(pair_idx, "")
+            video_direction = "A2B"
+            if "_B2A_" in selected_variant:
+                video_direction = "B2A"
+            rel_eval_target = "A_to_B"
 
             if not rt_path.is_file():
                 status = "missing_pred"
@@ -131,7 +160,15 @@ def main() -> None:
                 else:
                     r_pred_a = pred[0].reshape(3, 4)[:, :3]
                     r_pred_b = pred[-1].reshape(3, 4)[:, :3]
-                    r_pred_rel = r_pred_b @ r_pred_a.T
+                    if "_B2A_" in selected_variant:
+                        # video frames are [B ... A], so invert endpoint direction to
+                        # evaluate A->B consistently against GT(rel_a -> rel_b).
+                        r_pred_rel = r_pred_a @ r_pred_b.T
+                        rel_eval_target = "invert_B_to_A_to_match_A_to_B"
+                    else:
+                        # video frames are [A ... B], direct endpoint relation is A->B.
+                        r_pred_rel = r_pred_b @ r_pred_a.T
+                        rel_eval_target = "direct_A_to_B"
 
                     r_gt_a = q_to_r(quat_index[rel_a])
                     r_gt_b = q_to_r(quat_index[rel_b])
@@ -151,6 +188,9 @@ def main() -> None:
                     "rot_err_deg": rot_err_deg,
                     "gt_rel_rot_deg": gt_rel_rot_deg,
                     "pred_rel_rot_deg": pred_rel_rot_deg,
+                    "selected_variant": selected_variant,
+                    "video_direction": video_direction,
+                    "rel_eval_target": rel_eval_target,
                     "status": status,
                 }
             )
@@ -169,6 +209,9 @@ def main() -> None:
                 "rot_err_deg",
                 "gt_rel_rot_deg",
                 "pred_rel_rot_deg",
+                "selected_variant",
+                "video_direction",
+                "rel_eval_target",
                 "status",
             ],
         )

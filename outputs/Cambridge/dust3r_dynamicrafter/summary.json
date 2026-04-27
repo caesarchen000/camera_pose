@@ -1,0 +1,16 @@
+{
+  "Evaluated_pairs": 282,
+  "MRE_deg": 23.50559771352238,
+  "median_RE_deg": 6.716895354641476,
+  "R_acc_5": 0.3900709219858156,
+  "R_acc_15": 0.6843971631205674,
+  "R_acc_30": 0.7907801418439716,
+  "MTE_deg": null,
+  "median_TE_deg": null,
+  "t_acc_5": null,
+  "t_acc_15": null,
+  "t_acc_30": null,
+  "AUC30": null,
+  "AUC30_rot": 0.5975398000299803,
+  "AUC30_trans": null
+}

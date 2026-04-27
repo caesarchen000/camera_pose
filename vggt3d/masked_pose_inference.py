@@ -74,7 +74,13 @@ def _load_binary_masks(mask_dir: Path, n_frames: int, h: int, w: int, device: to
         m_t = torch.from_numpy(m)[None, None]  # [1,1,H,W]
         m_t = F.interpolate(m_t, size=(h, w), mode="nearest")[0, 0]  # [H,W]
         masks.append(m_t)
-    return torch.stack(masks, dim=0).to(device) > 0.5  # [S,H,W] bool
+    dyn_masks = torch.stack(masks, dim=0).to(device) > 0.5  # [S,H,W] bool
+    # Do not mask endpoints (first/last frame).
+    if dyn_masks.shape[0] >= 1:
+        dyn_masks[0] = False
+    if dyn_masks.shape[0] >= 2:
+        dyn_masks[-1] = False
+    return dyn_masks
 
 
 def _load_model(checkpoint: Path, device: torch.device) -> VGGTFor4D:
@@ -105,7 +111,10 @@ def main() -> None:
     frame_paths = _extract_video_frames_to_temp(video_path, tmp_frame_dir)
     images = load_and_preprocess_images([str(p) for p in frame_paths]).to(device)  # [S,3,H,W]
     n_frames, _, h_img, w_img = images.shape
-    dyn_masks = _load_binary_masks(mask_dir, n_frames, h_img, w_img, device)
+    if args.no_mask:
+        dyn_masks = torch.zeros((n_frames, h_img, w_img), dtype=torch.bool, device=device)
+    else:
+        dyn_masks = _load_binary_masks(mask_dir, n_frames, h_img, w_img, device)
 
     print(f"[info] Running masked inference: frames={n_frames}, size=({h_img},{w_img}), device={device}")
     predictions, _, _, _ = inference(model, images, dyn_masks=dyn_masks)
@@ -115,8 +124,9 @@ def main() -> None:
     np.save(out_dir / "cam2world.npy", predictions["cam2world"])
     np.save(out_dir / "extrinsic.npy", predictions["extrinsic"])
     # Save explicit R|t per frame as text: one line = 12 values (row-major 3x4).
-    extr = predictions["extrinsic"].reshape(predictions["extrinsic"].shape[0], -1)
-    np.savetxt(out_dir / "extrinsic_rt.txt", extr, fmt="%.8f")
+    extr = np.asarray(predictions["extrinsic"], dtype=np.float64)
+    extr_rt = extr[:, :3, :4].reshape(extr.shape[0], 12)
+    np.savetxt(out_dir / "extrinsic_rt.txt", extr_rt, fmt="%.8f")
     print(f"[done] Saved poses to {out_dir / 'pred_traj.txt'}")
 
 

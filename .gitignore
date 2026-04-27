@@ -6,7 +6,7 @@ datasets/
 data/
 metadata/
 Interpose/DL3DV_300_videos/
-Interpose/out_cambridge_selp_yaw50_65_286pairs/
+Interpose/Cambridge_286_videos/
 vggt3d/cambridge_interpose_selected/
 
 # Model checkpoints / weights

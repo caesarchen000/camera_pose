@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -65,8 +66,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start_index", type=int, default=0, help="Start pair_idx (inclusive).")
     p.add_argument("--end_index", type=int, default=-1, help="End pair_idx (inclusive), -1 means all.")
     p.add_argument("--max_pairs", type=int, default=0, help="Optional cap on processed pairs, 0 means all.")
+    p.add_argument(
+        "--mask_threshold",
+        type=float,
+        default=None,
+        help="Optional manual threshold for mask binarization; forwarded to demo pipeline.",
+    )
     p.add_argument("--skip_existing", action="store_true", help="Skip pairs with existing extrinsic_rt.txt.")
     p.add_argument("--keep_frames", action="store_true", help="Keep extracted frame folders.")
+    p.add_argument(
+        "--reuse_masks",
+        action="store_true",
+        help="Reuse existing masks under out_root/masks/<pair_name> and skip mask generation.",
+    )
+    p.add_argument(
+        "--pose_backend",
+        type=str,
+        default="vggt4d",
+        choices=["vggt4d", "vggt3d"],
+        help="Backend for pose inference after mask generation.",
+    )
     p.add_argument(
         "--use_selected_variants",
         action="store_true",
@@ -151,16 +170,43 @@ def _load_binary_masks(mask_dir: Path, n_frames: int, h: int, w: int, device: to
         m_t = torch.from_numpy(m)[None, None]  # [1,1,H,W]
         m_t = F.interpolate(m_t, size=(h, w), mode="nearest")[0, 0]
         masks.append(m_t)
-    return (torch.stack(masks, dim=0).to(device) > 0.5)  # [S,H,W]
+    dyn_masks = (torch.stack(masks, dim=0).to(device) > 0.5)  # [S,H,W]
+    # Keep first/last frames unmasked to preserve endpoint camera anchors.
+    if dyn_masks.shape[0] >= 1:
+        dyn_masks[0] = False
+    if dyn_masks.shape[0] >= 2:
+        dyn_masks[-1] = False
+    return dyn_masks
 
 
 def _run_masked_pose_for_scene(
     model,
     device: torch.device,
     frame_paths: list[Path],
+    video_path: Path,
     mask_dir: Path,
     pose_out_dir: Path,
+    pose_backend: str,
 ) -> None:
+    if pose_backend == "vggt3d":
+        script_path = _REPO_ROOT / "vggt3d" / "masked_pose_inference_vggt3d.py"
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--video_path",
+            str(video_path),
+            "--mask_dir",
+            str(mask_dir),
+            "--out_dir",
+            str(pose_out_dir),
+            "--mask_layers",
+            "5",
+            "--device",
+            str(device),
+        ]
+        subprocess.run(cmd, check=True)
+        return
+
     images = load_and_preprocess_images([str(p) for p in frame_paths]).to(device)  # [S,3,H,W]
     n_frames, _, h_img, w_img = images.shape
     dyn_masks = _load_binary_masks(mask_dir, n_frames, h_img, w_img, device)
@@ -200,7 +246,8 @@ def main() -> None:
     masks_root = out_root / "masks"
     poses_root = out_root / "poses"
     frames_root = out_root / "_frames"
-    masks_root.mkdir(parents=True, exist_ok=True)
+    if not args.reuse_masks:
+        masks_root.mkdir(parents=True, exist_ok=True)
     poses_root.mkdir(parents=True, exist_ok=True)
     frames_root.mkdir(parents=True, exist_ok=True)
 
@@ -248,8 +295,31 @@ def main() -> None:
             dst.symlink_to(fp)
 
         mask_scene_dir = masks_root / pair_name
-        process_scene_fn(scene_input, mask_scene_dir, model, device)
-        _run_masked_pose_for_scene(model, device, frame_paths, mask_scene_dir, pose_out_dir)
+        if args.reuse_masks:
+            if not mask_scene_dir.is_dir():
+                print(f"[skip] {pair_name}: missing existing mask dir {mask_scene_dir}")
+                continue
+            mask_files = sorted(mask_scene_dir.glob("dynamic_mask_*.png"))
+            if not mask_files:
+                print(f"[skip] {pair_name}: no dynamic_mask_*.png in {mask_scene_dir}")
+                continue
+        else:
+            process_scene_fn(
+                scene_input,
+                mask_scene_dir,
+                model,
+                device,
+                mask_threshold=args.mask_threshold,
+            )
+        _run_masked_pose_for_scene(
+            model,
+            device,
+            frame_paths,
+            video_path,
+            mask_scene_dir,
+            pose_out_dir,
+            args.pose_backend,
+        )
         processed += 1
         print(f"[done] {pair_name}")
 
